@@ -480,7 +480,7 @@ async function pipeOpenAISToAnthropic(source, res, reqModel, label = '?', onInte
   if (interrupted && !clientGone) {
     if (onInterrupted) { try { onInterrupted(interrupted); } catch (_) {} }
     debugLog(`[cut] ${label}: ${interrupted} — sent error event to client`);
-    send('error', { type: 'error', error: { type: 'api_error', message: `stream interrupted: ${interrupted}` } });
+    send('error', { type: 'error', error: { type: 'api_error', message: `upstream interrupted mid-response (transient — safe to retry, another model will be selected): ${interrupted}`, code: 'upstream_interrupted', retryable: true } });
   }
   if (!interrupted && stopReason === 'max_tokens') {
     debugLog(`[trunc] ${label}: model hit max_tokens — answer cut short`);
@@ -642,7 +642,7 @@ async function handleChat(req, res, protocol) {
     if (interrupted && !clientGone) {
       markFail(cand, 'mid-stream: ' + interrupted);
       debugLog(`[cut] ${label}: ${interrupted} — sent error event to client`);
-      res.write(`data: ${JSON.stringify({ error: { message: `stream interrupted: ${interrupted}`, type: 'server_error' } })}\n\n`);
+      res.write(`data: ${JSON.stringify({ error: { message: `upstream interrupted mid-response (transient — safe to retry, another model will be selected): ${interrupted}`, type: 'server_error', code: 'upstream_interrupted', retryable: true }, })}\n\n`);
     }
     if (!interrupted && finishSeen === 'length') {
       debugLog(`[trunc] ${label}: upstream ended with finish_reason=length — answer cut short by token cap`);
