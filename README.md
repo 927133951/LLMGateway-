@@ -281,11 +281,21 @@ curl http://localhost:4567/v1/messages \
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| GET | `/api/config` | 网关地址、Key、超时参数 |
+| GET | `/v1/models` | 合并模型列表 |
+| GET | `/v1/models/:id` | 单个模型详情 |
+| POST | `/v1/messages/count_tokens` | Anthropic 令牌计数（估算值，供 SDK 客户端调用） |
+| POST | `/v1/chat/completions` | OpenAI 协议对话 |
+| POST | `/v1/messages` | Claude 协议对话 |
+| GET | `/api/config` | 网关地址、Key、超时参数（仅本机管理用） |
 | GET | `/api/providers/list` | 全部上游及模型缓存 |
 | POST | `/api/providers` | 添加上游 `{name?, baseUrl, apiKey}`，立即拉取模型 |
 | DELETE | `/api/providers/:id` | 删除上游 |
 | POST | `/api/providers/:id/refresh` | 强制刷新该上游模型列表 |
+
+### 排查日志
+
+所有 `/v1/*` 请求与每次模型切换的成败都会写入项目目录下的 **`gateway.log`**，
+客户端报错时先看这个文件里对应时间点的记录。
 
 ---
 

@@ -44,18 +44,30 @@ function cors() {
 // Deep-walk a value and coerce every `id` property to a string.
 // Strict clients (Zod-based SDKs etc.) reject numeric ids with
 // "Expected 'id' to be a string" — this makes that error class impossible
-// regardless of what an upstream returns.
+// regardless of what an upstream returns. null/undefined/'' ids are
+// replaced with generated ones (null is NOT a string either).
 function sanitizeIds(v, depth = 0) {
   if (v == null || typeof v !== 'object' || depth > 12) return v;
   if (Array.isArray(v)) { for (let i = 0; i < v.length; i++) v[i] = sanitizeIds(v[i], depth + 1); return v; }
   for (const k of Object.keys(v)) {
-    if ((k === 'id' || k === 'tool_call_id') && v[k] != null && typeof v[k] !== 'string') {
-      v[k] = String(v[k]);
+    if ((k === 'id' || k === 'tool_call_id') && (v[k] == null || typeof v[k] !== 'string' || v[k] === '')) {
+      v[k] = (typeof v[k] === 'string' && v[k] !== '') ? v[k]
+        : (typeof v[k] === 'number' || typeof v[k] === 'boolean') ? String(v[k])
+        : genId('id');
     } else {
       v[k] = sanitizeIds(v[k], depth + 1);
     }
   }
   return v;
+}
+
+// Append-only debug log for /v1 traffic — the trail of exactly what the
+// gateway emitted, for diagnosing strict-client validation failures.
+function debugLog(line) {
+  const ts = new Date().toISOString();
+  const entry = `[${ts}] ${line}\n`;
+  process.stdout.write(entry);
+  fs.appendFile(path.join(__dirname, 'gateway.log'), entry, () => {});
 }
 function readBody(req) {
   return new Promise((resolve, reject) => {
@@ -417,22 +429,22 @@ async function handleChat(req, res, protocol) {
     const result = await callUpstream(cand, { ...openaiPayload, stream: wantsStream });
     if (!result.ok) {
       errors.push(`[${cand.provider.name}/${cand.model}] ${result.error}`);
-      console.log(`[fail] ${cand.provider.name}/${cand.model}: ${result.error}`);
+      debugLog(`[fail] ${cand.provider.name}/${cand.model}: ${result.error}`);
       continue;
     }
-    console.log(`[ok] ${cand.provider.name}/${cand.model} (${Date.now() - t0}ms)`);
+    debugLog(`[ok] ${cand.provider.name}/${cand.model} (${Date.now() - t0}ms)`);
 
     if (!wantsStream) {
       let data;
       try { data = await result.response.json(); } catch (e) {
         errors.push(`[${cand.provider.name}/${cand.model}] bad json: ${e.message}`);
-        console.log(`[fail] ${cand.provider.name}/${cand.model}: bad json`);
+        debugLog(`[fail] ${cand.provider.name}/${cand.model}: bad json`);
         continue;
       }
       const v = validateCompletion(data);
       if (!v.ok) {
         errors.push(`[${cand.provider.name}/${cand.model}] ${v.reason}`);
-        console.log(`[fail] ${cand.provider.name}/${cand.model}: ${v.reason}`);
+        debugLog(`[fail] ${cand.provider.name}/${cand.model}: ${v.reason}`);
         continue;
       }
       if (protocol === 'claude') return json(res, 200, openAIToClaude(v.data, body.model));
@@ -443,7 +455,7 @@ async function handleChat(req, res, protocol) {
     const probe = await probeUpstreamStream(result.response);
     if (!probe.ok) {
       errors.push(`[${cand.provider.name}/${cand.model}] stream: ${probe.error}`);
-      console.log(`[fail] ${cand.provider.name}/${cand.model}: stream ${probe.error}`);
+      debugLog(`[fail] ${cand.provider.name}/${cand.model}: stream ${probe.error}`);
       continue;
     }
 
@@ -566,9 +578,24 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname.startsWith('/api/')) return await handleApi(req, res, url);
 
     if (url.pathname === '/v1/models' && req.method === 'GET') return handleModels(req, res);
-    if (url.pathname === '/v1/chat/completions' && req.method === 'POST') return await handleChat(req, res, 'openai');
-    if (url.pathname === '/v1/messages' && req.method === 'POST') return await handleChat(req, res, 'claude');
+    const singleModel = url.pathname.match(/^\/v1\/models\/(.+)$/);
+    if (singleModel && req.method === 'GET') {
+      if (!authorized(req)) return json(res, 401, { error: { message: 'invalid gateway key' } });
+      const m = config.providers.flatMap(p => p.models || []).find(x => x.id === decodeURIComponent(singleModel[1]));
+      if (!m) return json(res, 404, { error: { message: 'model not found' } });
+      return json(res, 200, { id: m.id, object: 'model', owned_by: m.owned_by, type: 'model', display_name: m.id });
+    }
+    // Anthropic SDKs call this before every turn — must not 404
+    if (url.pathname === '/v1/messages/count_tokens' && req.method === 'POST') {
+      if (!authorized(req)) return json(res, 401, { error: { message: 'invalid gateway key' } });
+      const b = await readJSON(req).catch(() => ({}));
+      const text = JSON.stringify(b.system || '') + JSON.stringify(b.messages || []) + JSON.stringify(b.tools || []);
+      return json(res, 200, { input_tokens: Math.max(1, Math.ceil(text.length / 4)) });
+    }
+    if (url.pathname === '/v1/chat/completions' && req.method === 'POST') { debugLog(`${req.socket.remoteAddress} POST /v1/chat/completions`); return await handleChat(req, res, 'openai'); }
+    if (url.pathname === '/v1/messages' && req.method === 'POST') { debugLog(`${req.socket.remoteAddress} POST /v1/messages`); return await handleChat(req, res, 'claude'); }
 
+    debugLog(`404 ${req.method} ${url.pathname}`);
     json(res, 404, { error: { message: `no route: ${req.method} ${url.pathname}` } });
   } catch (e) {
     console.error('[server]', e);
