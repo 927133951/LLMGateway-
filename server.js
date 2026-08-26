@@ -126,15 +126,6 @@ async function callUpstream(candidate, openaiPayload) {
   }
 }
 
-// Idle watchdog: abort if no bytes for IDLE_TIMEOUT_MS during body consumption
-function makeIdleWatch(ctrl) {
-  let t = setTimeout(() => ctrl.abort(), IDLE_TIMEOUT_MS);
-  return {
-    kick() { clearTimeout(t); t = setTimeout(() => ctrl.abort(), IDLE_TIMEOUT_MS); },
-    stop() { clearTimeout(t); },
-  };
-}
-
 // ---------- protocol translation ----------
 function claudeToOpenAI(c) {
   const msgs = [];
@@ -179,15 +170,58 @@ function claudeToOpenAI(c) {
 
 function safeParseArgs(s) { try { return JSON.parse(s || '{}'); } catch { return {}; } }
 
+function normalizeContentText(c) {
+  if (typeof c === 'string') return c;
+  if (Array.isArray(c)) return c.map(b => (b && typeof b === 'object' && b.text) || '').join('');
+  return '';
+}
+
+// Validate an upstream "success" response. Free/aggregating gateways often
+// return 200 with empty completions, embedded error objects, or numeric ids —
+// all of which must count as FAILURES so the chain moves to the next model,
+// and ids must be coerced to strings so strict clients don't choke.
+function validateCompletion(data) {
+  if (!data || typeof data !== 'object') return { ok: false, reason: 'non-object response' };
+  if (data.error) return { ok: false, reason: 'embedded error: ' + JSON.stringify(data.error).slice(0, 200) };
+  const ch = data.choices;
+  if (!Array.isArray(ch) || ch.length === 0) return { ok: false, reason: 'no choices in response' };
+  const m = ch[0].message || {};
+  const text = normalizeContentText(m.content).trim();
+  const reasoning = String(m.reasoning_content ?? m.reasoning ?? '').trim();
+  const tools = Array.isArray(m.tool_calls)
+    ? m.tool_calls.filter(t => t && t.function && t.function.name)
+    : [];
+  if (!text && !reasoning && !tools.length) return { ok: false, reason: 'empty completion' };
+
+  data.id = (data.id == null || data.id === '') ? genId('chatcmpl') : String(data.id);
+  data.created = data.created ?? Math.floor(Date.now() / 1000);
+  ch[0].message = {
+    role: m.role || 'assistant',
+    content: text || null,
+    ...(reasoning ? { reasoning_content: reasoning } : {}),
+    ...(tools.length ? {
+      tool_calls: tools.map(t => ({
+        id: String(t.id || genId('call')),
+        type: 'function',
+        function: { name: String(t.function.name), arguments: t.function.arguments ?? '{}' },
+      })),
+    } : {}),
+  };
+  return { ok: true, data };
+}
+
 function openAIToClaude(o, reqModel) {
   const choice = (o.choices && o.choices[0]) || {};
   const msg = choice.message || {};
   const content = [];
   // some upstreams (deepseek-style) put output in reasoning_content
-  if (msg.reasoning_content) content.push({ type: 'thinking', thinking: msg.reasoning_content });
-  if (msg.content) content.push({ type: 'text', text: msg.content });
+  const reasoning = String(msg.reasoning_content ?? '').trim();
+  if (reasoning) content.push({ type: 'thinking', thinking: reasoning });
+  const txt = normalizeContentText(msg.content);
+  if (txt) content.push({ type: 'text', text: txt });
   for (const tc of msg.tool_calls || []) {
-    content.push({ type: 'tool_use', id: tc.id || genId('toolu'), name: tc.function?.name, input: safeParseArgs(tc.function?.arguments) });
+    if (!tc?.function?.name) continue;
+    content.push({ type: 'tool_use', id: String(tc.id || genId('toolu')), name: String(tc.function.name), input: safeParseArgs(tc.function.arguments) });
   }
   if (!content.length) content.push({ type: 'text', text: '' });
   return {
@@ -199,8 +233,54 @@ function openAIToClaude(o, reqModel) {
   };
 }
 
+// Peek into an upstream SSE stream until we know it's actually delivering
+// content. 200 + immediate error events / instant [DONE] / garbage must count
+// as failures so the chain can still switch models — nothing has been sent to
+// the client yet at probe time.
+async function probeUpstreamStream(response) {
+  const reader = response.body.getReader();
+  const dec = new TextDecoder();
+  const rawChunks = [];   // exact bytes, replayed to client on commit (OpenAI passthrough)
+  let parseBuf = '';      // decoded text for event parsing
+
+  while (true) {
+    let r;
+    try {
+      r = await Promise.race([
+        reader.read(),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('probe idle timeout')), IDLE_TIMEOUT_MS)),
+      ]);
+    } catch (e) {
+      reader.cancel().catch(() => {});
+      return { ok: false, error: e.message };
+    }
+    if (r.done) return { ok: false, error: 'stream ended before any content' };
+    rawChunks.push(r.value);
+    parseBuf += dec.decode(r.value, { stream: true });
+
+    const lines = parseBuf.split('\n');
+    parseBuf = lines.pop();
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith('data:')) continue;
+      const ds = trimmed.slice(5).trim();
+      if (ds === '[DONE]') return { ok: false, error: 'stream completed with no usable content' };
+      let j; try { j = JSON.parse(ds); } catch { continue; }
+      if (j.error) return { ok: false, error: 'upstream stream error: ' + JSON.stringify(j.error).slice(0, 200) };
+      const d = j.choices?.[0]?.delta || {};
+      if (
+        (d.content && String(d.content).length) ||
+        (d.reasoning_content && String(d.reasoning_content).length) ||
+        (Array.isArray(d.tool_calls) && d.tool_calls.length)
+      ) {
+        return { ok: true, reader, chunks: rawChunks, backlog: lines.join('\n') + '\n' + parseBuf };
+      }
+    }
+  }
+}
+
 // Translate an upstream OpenAI SSE stream into an Anthropic SSE stream
-async function pipeOpenAISToAnthropic(upstream, res, reqModel) {
+async function pipeOpenAISToAnthropic(source, res, reqModel) {
   const enc = new TextEncoder();
   res.writeHead(200, {
     'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache',
@@ -214,7 +294,7 @@ async function pipeOpenAISToAnthropic(upstream, res, reqModel) {
   });
 
   const decoder = new TextDecoder();
-  let buf = '', outTokens = 0, stopReason = 'end_turn', nextIndex = 0;
+  let outTokens = 0, stopReason = 'end_turn', nextIndex = 0;
   let textIdx = -1, thinkIdx = -1;
   const openToolBlocks = new Map(); // index -> {id, name, out}
 
@@ -236,7 +316,8 @@ async function pipeOpenAISToAnthropic(upstream, res, reqModel) {
     }
   }
 
-  const reader = upstream.body.getReader();
+  const reader = source.reader;
+  let buf = source.backlog || '';
   let idleTimer = setTimeout(() => reader.cancel().catch(() => {}), IDLE_TIMEOUT_MS);
   const resetIdle = () => { clearTimeout(idleTimer); idleTimer = setTimeout(() => reader.cancel().catch(() => {}), IDLE_TIMEOUT_MS); };
   try {
@@ -328,33 +409,49 @@ async function handleChat(req, res, protocol) {
       let data;
       try { data = await result.response.json(); } catch (e) {
         errors.push(`[${cand.provider.name}/${cand.model}] bad json: ${e.message}`);
+        console.log(`[fail] ${cand.provider.name}/${cand.model}: bad json`);
         continue;
       }
-      if (protocol === 'claude') return json(res, 200, openAIToClaude(data, body.model));
-      return json(res, 200, data);
+      const v = validateCompletion(data);
+      if (!v.ok) {
+        errors.push(`[${cand.provider.name}/${cand.model}] ${v.reason}`);
+        console.log(`[fail] ${cand.provider.name}/${cand.model}: ${v.reason}`);
+        continue;
+      }
+      if (protocol === 'claude') return json(res, 200, openAIToClaude(v.data, body.model));
+      return json(res, 200, v.data);
     }
 
-    // streaming
+    // streaming — probe first so a dead upstream still allows failover
+    const probe = await probeUpstreamStream(result.response);
+    if (!probe.ok) {
+      errors.push(`[${cand.provider.name}/${cand.model}] stream: ${probe.error}`);
+      console.log(`[fail] ${cand.provider.name}/${cand.model}: stream ${probe.error}`);
+      continue;
+    }
+
     if (protocol === 'claude') {
-      try { await pipeOpenAISToAnthropic(result.response, res, body.model); } catch (_) {}
+      try { await pipeOpenAISToAnthropic(probe, res, body.model); } catch (_) {}
       return;
     }
-    // OpenAI passthrough
+    // OpenAI passthrough — replay probed bytes then pipe the rest raw
     res.writeHead(200, {
       'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache',
       'Connection': 'keep-alive', ...cors(),
     });
-    const reader = result.response.body.getReader();
-    const idle = makeIdleWatch(new AbortController());
+    for (const c of probe.chunks) res.write(c);
+    const reader = probe.reader;
+    let idleTimer = setTimeout(() => reader.cancel().catch(() => {}), IDLE_TIMEOUT_MS);
+    const kick = () => { clearTimeout(idleTimer); idleTimer = setTimeout(() => reader.cancel().catch(() => {}), IDLE_TIMEOUT_MS); };
     try {
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-        idle.kick();
+        kick();
         res.write(value);
       }
     } catch (_) {}
-    idle.stop();
+    clearTimeout(idleTimer);
     res.end();
     return;
   }
