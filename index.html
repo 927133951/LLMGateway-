@@ -70,9 +70,16 @@
     <div style="margin-top:12px">
       <div class="row" style="justify-content:space-between">
         <b style="font-size:13px">全局系统提示词（自动注入所有请求，留空则不注入）</b>
-        <button onclick="saveSystemPrompt()">保存提示词</button>
+        <button onclick="saveConfig()">保存提示词</button>
       </div>
       <textarea id="sysPrompt" rows="3" placeholder="例如：你必须始终使用简体中文思考和回答所有问题，无论用户使用什么语言。" style="width:100%;margin-top:6px;resize:vertical"></textarea>
+    </div>
+    <div class="row" style="margin-top:12px">
+      <b style="font-size:13px">小模型过滤（auto 模式不调度低于该参数量的模型）</b>
+      <span style="font-size:12px;color:var(--dim)">≥</span>
+      <input id="minParams" type="number" min="0" step="1" style="width:80px">
+      <span style="font-size:12px;color:var(--dim)">B（0 = 不过滤；点名指定模型不受影响）</span>
+      <button onclick="saveConfig()">保存全部设置</button>
     </div>
   </div>
 
@@ -146,18 +153,19 @@ async function loadAll() {
   $('gwUrl').value = config.baseUrl;
   $('gwKey').value = config.gatewayKey;
   if (document.activeElement !== $('sysPrompt')) $('sysPrompt').value = config.systemPrompt || '';
+  $('minParams').value = config.minModelParamsB || 0;
   providers = await api('/api/providers/list').catch(() => []);
   // fallback: derive from models endpoint? keep simple: server returns list
   render();
 }
 
-async function saveSystemPrompt() {
+async function saveConfig() {
   try {
     await api('/api/config', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ systemPrompt: $('sysPrompt').value }),
+      body: JSON.stringify({ systemPrompt: $('sysPrompt').value, minModelParamsB: $('minParams').value }),
     });
-    toast('提示词已保存，立即生效');
+    toast('设置已保存，立即生效');
   } catch (e) { toast('保存失败: ' + e.message); }
 }
 

@@ -152,6 +152,29 @@ function markFail(c, err) {
   debugLog(`[cool] ${c.provider.name}/${c.model} benched ${Math.round(ms / 1000)}s (${String(err || 'error').slice(0, 90)})`);
 }
 
+// ---------- small-model filter ----------
+// Parse parameter count from a model id: "glm-z1-9b-free" -> 9,
+// "nemotron-3-super-120b-a12b" -> 120 (total beats MoE active "a12b"),
+// "mixtral-8x7b" -> 56 (multiplier). Returns null when unparseable
+// (unknown-size models are always kept — absence of evidence is not evidence).
+function parseParamCount(id) {
+  const s = String(id || '').toLowerCase();
+  const mul = s.match(/(\d+(?:\.\d+)?)x(\d+(?:\.\d+)?)b\b/);
+  if (mul) return parseFloat(mul[1]) * parseFloat(mul[2]);
+  let best = null;
+  for (const m of s.matchAll(/(\d+(?:\.\d+)?)b(?![a-z0-9])/g)) {
+    const v = parseFloat(m[1]);
+    if (best == null || v > best) best = v;
+  }
+  return best;
+}
+function passesSizeFilter(modelId) {
+  const minB = +(config.minModelParamsB || 0);
+  if (minB <= 0) return true;
+  const p = parseParamCount(modelId);
+  return p == null ? true : p >= minB;
+}
+
 // Build ordered candidate chain [{provider, model}]
 let autoCursor = 0;
 let lastOffset = 0;
@@ -159,8 +182,13 @@ function candidatesFor(model) {
   const provs = config.providers.filter(p => (p.models || []).length > 0);
   if (!provs.length) return [];
   let chain;
-  if (!model || model === 'auto') {
+  const isAuto = !model || model === 'auto';
+  if (isAuto) {
     chain = provs.flatMap(p => p.models.map(m => ({ provider: p, model: m.id })));
+    // size filter only applies to auto mode; an explicit model name is
+    // explicit user intent and is always honored
+    const filtered = chain.filter(c => passesSizeFilter(c.model));
+    if (filtered.length) chain = filtered;
   } else {
     chain = provs.flatMap(p => p.models.filter(m => m.id === model).map(() => ({ provider: p, model })));
     if (!chain.length) chain = provs.map(p => ({ provider: p, model })); // raw name everywhere
@@ -173,7 +201,6 @@ function candidatesFor(model) {
   hot.sort((a, b) => (b.h.lastOkAt - a.h.lastOkAt) || (a.i - b.i));
   cold.sort((a, b) => a.h.coolUntil - b.h.coolUntil);
   const ordered = hot.concat(cold).map(x => x.c);
-  const isAuto = !model || model === 'auto';
   const off = isAuto ? (autoCursor % ordered.length) : 0;
   lastOffset = off;
   return ordered.slice(off).concat(ordered.slice(0, off));
@@ -688,14 +715,19 @@ async function handleApi(req, res, url) {
       port: PORT, gatewayKey: config.gatewayKey,
       baseUrl: `http://localhost:${PORT}/v1`,
       systemPrompt: config.systemPrompt || '',
+      minModelParamsB: +(config.minModelParamsB || 0),
       timeout: { connectMs: CONNECT_TIMEOUT_MS, idleMs: IDLE_TIMEOUT_MS },
     });
   }
   if (route === 'POST /api/config') {
     const b = await readJSON(req);
     if ('systemPrompt' in b) config.systemPrompt = String(b.systemPrompt || '');
+    if ('minModelParamsB' in b) {
+      const v = parseFloat(b.minModelParamsB);
+      config.minModelParamsB = isNaN(v) || v < 0 ? 0 : v;
+    }
     save();
-    return json(res, 200, { ok: true, systemPrompt: config.systemPrompt || '' });
+    return json(res, 200, { ok: true, systemPrompt: config.systemPrompt || '', minModelParamsB: +(config.minModelParamsB || 0) });
   }
   if (route === 'GET /api/providers/list') {
     return json(res, 200, config.providers);
