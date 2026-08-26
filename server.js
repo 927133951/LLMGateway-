@@ -463,6 +463,9 @@ async function pipeOpenAISToAnthropic(source, res, reqModel, label = '?', onInte
     debugLog(`[cut] ${label}: ${interrupted} — sent error event to client`);
     send('error', { type: 'error', error: { type: 'api_error', message: `stream interrupted: ${interrupted}` } });
   }
+  if (!interrupted && stopReason === 'max_tokens') {
+    debugLog(`[trunc] ${label}: model hit max_tokens — answer cut short`);
+  }
   send('message_delta', { type: 'message_delta', delta: { stop_reason: stopReason, stop_sequence: null }, usage: { output_tokens: outTokens } });
   send('message_stop', { type: 'message_stop' });
   res.end();
@@ -481,6 +484,14 @@ async function handleChat(req, res, protocol) {
   if (!body || !body.messages) return;
 
   const openaiPayload = protocol === 'claude' ? claudeToOpenAI(body) : body;
+
+  // Many tools omit max_tokens; backends then apply tiny internal defaults
+  // and truncate mid-answer (looks like "conversation just died").
+  // Give reasoning models room to think unless the caller chose a value.
+  const MAX_TOKENS_DEFAULT = +(process.env.MAX_TOKENS_DEFAULT || 8192);
+  if (openaiPayload.max_tokens == null) openaiPayload.max_tokens = MAX_TOKENS_DEFAULT;
+
+  debugLog(`${req.socket.remoteAddress} ${protocol} proto | model=${openaiPayload.model} | stream=${!!openaiPayload.stream} | msgs=${(openaiPayload.messages || []).length}`);
 
   // global system prompt steering (e.g. force Chinese replies)
   const sys = String(config.systemPrompt || '').trim();
@@ -560,7 +571,7 @@ async function handleChat(req, res, protocol) {
     const reader = probe.reader;
     const dec = new TextDecoder();
     let carry = '';
-    let sawDone = false, interrupted = null, clientGone = false, idleFired = false;
+    let sawDone = false, interrupted = null, clientGone = false, idleFired = false, finishSeen = null;
     res.on('close', () => { clientGone = true; });
     const onClientClose = () => reader.cancel().catch(() => {});
     res.on('close', onClientClose);
@@ -576,8 +587,13 @@ async function handleChat(req, res, protocol) {
         const trimmed = line.trim();
         if (trimmed.startsWith('data:') && trimmed !== 'data: [DONE]' && trimmed !== 'data:[DONE]') {
           const ds = trimmed.slice(5).trim();
-          try { res.write(`data: ${JSON.stringify(sanitizeIds(JSON.parse(ds)))}\n\n`); continue; }
-          catch { /* not JSON — forward untouched */ }
+          try {
+            const obj = JSON.parse(ds);
+            const fr = obj.choices?.[0]?.finish_reason;
+            if (fr) finishSeen = fr;
+            res.write(`data: ${JSON.stringify(sanitizeIds(obj))}\n\n`);
+            continue;
+          } catch { /* not JSON — forward untouched */ }
         } else if (trimmed === 'data: [DONE]' || trimmed === 'data:[DONE]') {
           sawDone = true;
         }
@@ -603,6 +619,9 @@ async function handleChat(req, res, protocol) {
       markFail(cand, 'mid-stream: ' + interrupted);
       debugLog(`[cut] ${label}: ${interrupted} — sent error event to client`);
       res.write(`data: ${JSON.stringify({ error: { message: `stream interrupted: ${interrupted}`, type: 'server_error' } })}\n\n`);
+    }
+    if (!interrupted && finishSeen === 'length') {
+      debugLog(`[trunc] ${label}: upstream ended with finish_reason=length — answer cut short by token cap`);
     }
     res.end();
     return;
