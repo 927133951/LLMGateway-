@@ -522,6 +522,13 @@ async function handleChat(req, res, protocol) {
     } else {
       openaiPayload.messages.unshift({ role: 'system', content: sys });
     }
+    // recency reinforcement: small models ignore opening instructions when
+    // drowning in long foreign-language context, so pin the requirement to
+    // the very end of the visible context as well
+    const last = openaiPayload.messages[openaiPayload.messages.length - 1];
+    if (last && last.role === 'user' && typeof last.content === 'string') {
+      last.content += '\n\n[System] ' + sys;
+    }
   }
 
   const chain = candidatesFor(openaiPayload.model === undefined ? body.model : openaiPayload.model);
