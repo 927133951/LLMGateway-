@@ -67,6 +67,13 @@
       Claude 协议: <code>POST /v1/messages</code> (x-api-key 或 Bearer 均可) &nbsp;·&nbsp;
       模型列表: <code>GET /v1/models</code>
     </div>
+    <div style="margin-top:12px">
+      <div class="row" style="justify-content:space-between">
+        <b style="font-size:13px">全局系统提示词（自动注入所有请求，留空则不注入）</b>
+        <button onclick="saveSystemPrompt()">保存提示词</button>
+      </div>
+      <textarea id="sysPrompt" rows="3" placeholder="例如：你必须始终使用简体中文思考和回答所有问题，无论用户使用什么语言。" style="width:100%;margin-top:6px;resize:vertical"></textarea>
+    </div>
   </div>
 
   <!-- 添加上游 -->
@@ -138,9 +145,20 @@ async function loadAll() {
   config = await api('/api/config');
   $('gwUrl').value = config.baseUrl;
   $('gwKey').value = config.gatewayKey;
+  if (document.activeElement !== $('sysPrompt')) $('sysPrompt').value = config.systemPrompt || '';
   providers = await api('/api/providers/list').catch(() => []);
   // fallback: derive from models endpoint? keep simple: server returns list
   render();
+}
+
+async function saveSystemPrompt() {
+  try {
+    await api('/api/config', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ systemPrompt: $('sysPrompt').value }),
+    });
+    toast('提示词已保存，立即生效');
+  } catch (e) { toast('保存失败: ' + e.message); }
 }
 
 // ---- providers ----

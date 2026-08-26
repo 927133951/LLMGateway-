@@ -481,6 +481,19 @@ async function handleChat(req, res, protocol) {
   if (!body || !body.messages) return;
 
   const openaiPayload = protocol === 'claude' ? claudeToOpenAI(body) : body;
+
+  // global system prompt steering (e.g. force Chinese replies)
+  const sys = String(config.systemPrompt || '').trim();
+  if (sys && Array.isArray(openaiPayload.messages)) {
+    const idx = openaiPayload.messages.findIndex(m => m.role === 'system');
+    if (idx >= 0) {
+      const prev = typeof openaiPayload.messages[idx].content === 'string' ? openaiPayload.messages[idx].content : JSON.stringify(openaiPayload.messages[idx].content);
+      openaiPayload.messages[idx] = { role: 'system', content: sys + '\n\n' + prev };
+    } else {
+      openaiPayload.messages.unshift({ role: 'system', content: sys });
+    }
+  }
+
   const chain = candidatesFor(openaiPayload.model === undefined ? body.model : openaiPayload.model);
   if (!chain.length) return json(res, 503, { error: { message: 'no providers/models configured' } });
 
@@ -624,8 +637,15 @@ async function handleApi(req, res, url) {
     return json(res, 200, {
       port: PORT, gatewayKey: config.gatewayKey,
       baseUrl: `http://localhost:${PORT}/v1`,
+      systemPrompt: config.systemPrompt || '',
       timeout: { connectMs: CONNECT_TIMEOUT_MS, idleMs: IDLE_TIMEOUT_MS },
     });
+  }
+  if (route === 'POST /api/config') {
+    const b = await readJSON(req);
+    if ('systemPrompt' in b) config.systemPrompt = String(b.systemPrompt || '');
+    save();
+    return json(res, 200, { ok: true, systemPrompt: config.systemPrompt || '' });
   }
   if (route === 'GET /api/providers/list') {
     return json(res, 200, config.providers);
