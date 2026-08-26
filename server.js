@@ -29,7 +29,7 @@ function normalizeBase(url) {
 
 // ---------- helpers ----------
 function json(res, code, obj) {
-  const body = JSON.stringify(obj);
+  const body = JSON.stringify(sanitizeIds(obj));
   res.writeHead(code, { 'Content-Type': 'application/json', ...cors() });
   res.end(body);
 }
@@ -39,6 +39,23 @@ function cors() {
     'Access-Control-Allow-Headers': '*',
     'Access-Control-Allow-Methods': 'GET,POST,DELETE,OPTIONS',
   };
+}
+
+// Deep-walk a value and coerce every `id` property to a string.
+// Strict clients (Zod-based SDKs etc.) reject numeric ids with
+// "Expected 'id' to be a string" — this makes that error class impossible
+// regardless of what an upstream returns.
+function sanitizeIds(v, depth = 0) {
+  if (v == null || typeof v !== 'object' || depth > 12) return v;
+  if (Array.isArray(v)) { for (let i = 0; i < v.length; i++) v[i] = sanitizeIds(v[i], depth + 1); return v; }
+  for (const k of Object.keys(v)) {
+    if ((k === 'id' || k === 'tool_call_id') && v[k] != null && typeof v[k] !== 'string') {
+      v[k] = String(v[k]);
+    } else {
+      v[k] = sanitizeIds(v[k], depth + 1);
+    }
+  }
+  return v;
 }
 function readBody(req) {
   return new Promise((resolve, reject) => {
@@ -350,7 +367,7 @@ async function pipeOpenAISToAnthropic(source, res, reqModel) {
             thinkIdx = closeBlock(thinkIdx);
             textIdx = closeBlock(textIdx);
             const blkIndex = nextIndex++;
-            openToolBlocks.set(idx, { id: tc.id || genId('toolu'), name: tc.function?.name || '', out: blkIndex, declared: false });
+            openToolBlocks.set(idx, { id: (tc.id != null && tc.id !== '') ? String(tc.id) : genId('toolu'), name: tc.function?.name || '', out: blkIndex, declared: false });
           }
           const tb = openToolBlocks.get(idx);
           if (tc.function?.name) tb.name = tc.function.name;
@@ -434,22 +451,40 @@ async function handleChat(req, res, protocol) {
       try { await pipeOpenAISToAnthropic(probe, res, body.model); } catch (_) {}
       return;
     }
-    // OpenAI passthrough — replay probed bytes then pipe the rest raw
+    // OpenAI passthrough — replay probed bytes then pipe the rest,
+    // rewriting every SSE chunk so ids are always strings
     res.writeHead(200, {
       'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache',
       'Connection': 'keep-alive', ...cors(),
     });
-    for (const c of probe.chunks) res.write(c);
     const reader = probe.reader;
+    const dec = new TextDecoder();
+    let carry = '';
     let idleTimer = setTimeout(() => reader.cancel().catch(() => {}), IDLE_TIMEOUT_MS);
     const kick = () => { clearTimeout(idleTimer); idleTimer = setTimeout(() => reader.cancel().catch(() => {}), IDLE_TIMEOUT_MS); };
+    const writeSanitized = text => {
+      // process line-wise, preserving the exact event boundaries
+      const lines = text.split('\n');
+      carry = lines.pop();
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (trimmed.startsWith('data:') && trimmed !== 'data: [DONE]' && trimmed !== 'data:[DONE]') {
+          const ds = trimmed.slice(5).trim();
+          try { res.write(`data: ${JSON.stringify(sanitizeIds(JSON.parse(ds)))}\n\n`); continue; }
+          catch { /* not JSON — forward untouched */ }
+        }
+        res.write(line + '\n');
+      }
+    };
     try {
+      for (const c of probe.chunks) writeSanitized(dec.decode(c, { stream: true }));
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
         kick();
-        res.write(value);
+        writeSanitized(dec.decode(value, { stream: true }));
       }
+      if (carry) res.write(carry + '\n');
     } catch (_) {}
     clearTimeout(idleTimer);
     res.end();
