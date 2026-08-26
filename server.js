@@ -115,8 +115,36 @@ async function refreshProviderModels(provider) {
   return provider;
 }
 
+// ---------- model health (in-memory circuit breaker) ----------
+// Without this, a pool of 700 models means client retries re-walk the same
+// first few dead entries forever. Failed models get benched (cooldown),
+// proven-good models float to the front, and the auto cursor resumes where
+// the previous request gave up instead of advancing one slot.
+const HEALTH = new Map();
+const FAIL_COOLDOWN_MS = +(process.env.FAIL_COOLDOWN_MS || 300000);   // bench 5min after a failure
+const RATE_COOLDOWN_MS = +(process.env.RATE_COOLDOWN_MS || 600000);   // bench 10min after rate-limit
+const hkey = c => c.provider.id + '|' + c.model;
+function hget(c) {
+  let h = HEALTH.get(hkey(c));
+  if (!h) { h = { oks: 0, fails: 0, lastOkAt: 0, coolUntil: 0 }; HEALTH.set(hkey(c), h); }
+  return h;
+}
+function markOk(c) {
+  const h = hget(c);
+  h.oks++; h.lastOkAt = Date.now(); h.coolUntil = 0;
+}
+function markFail(c, err) {
+  const h = hget(c);
+  h.fails++;
+  const rate = /429|rate.?limit|too many/i.test(String(err || ''));
+  const ms = rate ? RATE_COOLDOWN_MS : FAIL_COOLDOWN_MS;
+  h.coolUntil = Date.now() + ms;
+  debugLog(`[cool] ${c.provider.name}/${c.model} benched ${Math.round(ms / 1000)}s (${String(err || 'error').slice(0, 90)})`);
+}
+
 // Build ordered candidate chain [{provider, model}]
-let rrCounter = 0;
+let autoCursor = 0;
+let lastOffset = 0;
 function candidatesFor(model) {
   const provs = config.providers.filter(p => (p.models || []).length > 0);
   if (!provs.length) return [];
@@ -127,8 +155,18 @@ function candidatesFor(model) {
     chain = provs.flatMap(p => p.models.filter(m => m.id === model).map(() => ({ provider: p, model })));
     if (!chain.length) chain = provs.map(p => ({ provider: p, model })); // raw name everywhere
   }
-  const off = rrCounter++ % Math.max(chain.length, 1); // rotate start to spread load
-  return chain.slice(off).concat(chain.slice(0, off));
+  const now = Date.now();
+  const scored = chain.map((c, i) => ({ c, i, h: hget(c) }));
+  const hot = scored.filter(x => x.h.coolUntil <= now);     // not benched
+  const cold = scored.filter(x => x.h.coolUntil > now);      // recently failed — sink to the end
+  // recently proven-good first, then untried (original order), then benched by soonest recovery
+  hot.sort((a, b) => (b.h.lastOkAt - a.h.lastOkAt) || (a.i - b.i));
+  cold.sort((a, b) => a.h.coolUntil - b.h.coolUntil);
+  const ordered = hot.concat(cold).map(x => x.c);
+  const isAuto = !model || model === 'auto';
+  const off = isAuto ? (autoCursor % ordered.length) : 0;
+  lastOffset = off;
+  return ordered.slice(off).concat(ordered.slice(0, off));
 }
 
 // POST one chat completion. Returns {ok, response|error}
@@ -309,7 +347,7 @@ async function probeUpstreamStream(response) {
 }
 
 // Translate an upstream OpenAI SSE stream into an Anthropic SSE stream
-async function pipeOpenAISToAnthropic(source, res, reqModel, label = '?') {
+async function pipeOpenAISToAnthropic(source, res, reqModel, label = '?', onInterrupted = null) {
   const enc = new TextEncoder();
   res.writeHead(200, {
     'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache',
@@ -421,6 +459,7 @@ async function pipeOpenAISToAnthropic(source, res, reqModel, label = '?') {
   closeBlock(textIdx);
   for (const tb of openToolBlocks.values()) send('content_block_stop', { type: 'content_block_stop', index: tb.out });
   if (interrupted && !clientGone) {
+    if (onInterrupted) { try { onInterrupted(interrupted); } catch (_) {} }
     debugLog(`[cut] ${label}: ${interrupted} — sent error event to client`);
     send('error', { type: 'error', error: { type: 'api_error', message: `stream interrupted: ${interrupted}` } });
   }
@@ -447,11 +486,14 @@ async function handleChat(req, res, protocol) {
 
   const wantsStream = !!openaiPayload.stream;
   const errors = [];
+  let tried = 0;
 
   for (const cand of chain) {
+    tried++;
     const t0 = Date.now();
     const result = await callUpstream(cand, { ...openaiPayload, stream: wantsStream });
     if (!result.ok) {
+      markFail(cand, result.error);
       errors.push(`[${cand.provider.name}/${cand.model}] ${result.error}`);
       debugLog(`[fail] ${cand.provider.name}/${cand.model}: ${result.error}`);
       continue;
@@ -461,16 +503,19 @@ async function handleChat(req, res, protocol) {
     if (!wantsStream) {
       let data;
       try { data = await result.response.json(); } catch (e) {
+        markFail(cand, 'bad json: ' + e.message);
         errors.push(`[${cand.provider.name}/${cand.model}] bad json: ${e.message}`);
         debugLog(`[fail] ${cand.provider.name}/${cand.model}: bad json`);
         continue;
       }
       const v = validateCompletion(data);
       if (!v.ok) {
+        markFail(cand, v.reason);
         errors.push(`[${cand.provider.name}/${cand.model}] ${v.reason}`);
         debugLog(`[fail] ${cand.provider.name}/${cand.model}: ${v.reason}`);
         continue;
       }
+      markOk(cand);
       if (protocol === 'claude') return json(res, 200, openAIToClaude(v.data, body.model));
       return json(res, 200, v.data);
     }
@@ -478,13 +523,18 @@ async function handleChat(req, res, protocol) {
     // streaming — probe first so a dead upstream still allows failover
     const probe = await probeUpstreamStream(result.response);
     if (!probe.ok) {
+      markFail(cand, 'stream: ' + probe.error);
       errors.push(`[${cand.provider.name}/${cand.model}] stream: ${probe.error}`);
       debugLog(`[fail] ${cand.provider.name}/${cand.model}: stream ${probe.error}`);
       continue;
     }
+    markOk(cand);
 
     if (protocol === 'claude') {
-      try { await pipeOpenAISToAnthropic(probe, res, body.model, `${cand.provider.name}/${cand.model}`); } catch (_) {}
+      try {
+        await pipeOpenAISToAnthropic(probe, res, body.model, `${cand.provider.name}/${cand.model}`,
+          reason => markFail(cand, 'mid-stream: ' + reason));
+      } catch (_) {}
       return;
     }
     // OpenAI passthrough — replay probed bytes then pipe the rest,
@@ -537,11 +587,18 @@ async function handleChat(req, res, protocol) {
     if (!interrupted && !sawDone && !clientGone) interrupted = 'upstream ended without [DONE]';
     if (idleFired && !sawDone) interrupted = `no data for ${IDLE_TIMEOUT_MS}ms (idle timeout)`;
     if (interrupted && !clientGone) {
+      markFail(cand, 'mid-stream: ' + interrupted);
       debugLog(`[cut] ${label}: ${interrupted} — sent error event to client`);
       res.write(`data: ${JSON.stringify({ error: { message: `stream interrupted: ${interrupted}`, type: 'server_error' } })}\n\n`);
     }
     res.end();
     return;
+  }
+
+  // whole chain exhausted — remember how deep we got so the next request
+  // (e.g. a client retry) resumes AFTER these instead of re-walking them
+  if (!model || model === 'auto') {
+    autoCursor = (lastOffset + tried) % Math.max(chain.length, 1);
   }
 
   json(res, 502, {
