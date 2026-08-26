@@ -1,0 +1,9 @@
+# 敏感配置：包含真实上游 API Key 和网关 Key，禁止提交
+providers.json
+
+# 运行时产物
+.runtime/
+*.log
+
+# 工作区杂项
+snapshots/

@@ -1,0 +1,13 @@
+{
+  "_comment": "复制本文件为 providers.json 即可保留结构。实际运行时 server.js 会自动生成 providers.json（含随机网关 Key），通常不需要手动创建。",
+  "gatewayKey": "sk-gw-自动生成无需填写",
+  "providers": [
+    {
+      "id": "prov_example",
+      "name": "my-upstream",
+      "baseUrl": "https://api.example.com",
+      "apiKey": "sk-你的上游密钥",
+      "models": []
+    }
+  ]
+}

@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LLM Gateway 控制台</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --border: #30363d;
+    --text: #e6edf3; --dim: #8b949e; --accent: #58a6ff; --green: #3fb950; --red: #f85149; --yellow: #d29922;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: "Segoe UI", "Microsoft YaHei", sans-serif; font-size: 14px; padding: 24px; }
+  .wrap { max-width: 1100px; margin: 0 auto; }
+  h1 { font-size: 20px; margin-bottom: 4px; }
+  .sub { color: var(--dim); margin-bottom: 20px; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+  input, select, textarea {
+    background: var(--bg); border: 1px solid var(--border); color: var(--text);
+    border-radius: 6px; padding: 8px 10px; font-size: 13px; outline: none;
+  }
+  input:focus { border-color: var(--accent); }
+  button {
+    background: #21262d; color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 8px 14px; cursor: pointer; font-size: 13px;
+  }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: #1f6feb; border-color: #1f6feb; }
+  button.danger:hover { border-color: var(--red); color: var(--red); }
+  code, .mono { font-family: Consolas, monospace; font-size: 12px; }
+  .kv { display: flex; align-items: center; gap: 8px; margin: 6px 0; }
+  .kv label { width: 90px; color: var(--dim); font-size: 12px; }
+  .kv input { flex: 1; }
+  .copy { font-size: 11px; padding: 4px 8px; }
+  table { width: 100%; border-collapse: collapse; margin-top: 8px; }
+  th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--border); font-size: 12.5px; }
+  th { color: var(--dim); font-weight: 500; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; }
+  .ok   { background: rgba(63,185,80,.15); color: var(--green); }
+  .err  { background: rgba(248,81,73,.15); color: var(--red); }
+  .prov-card { border: 1px solid var(--border); border-radius: 6px; padding: 12px; margin-top: 10px; }
+  .prov-head { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; }
+  .prov-name { font-weight: 600; }
+  .prov-url { color: var(--dim); font-size: 12px; word-break: break-all; }
+  .models-list { margin-top: 8px; max-height: 160px; overflow-y: auto; display: flex; flex-wrap: wrap; gap: 6px; }
+  .chip { background: var(--bg); border: 1px solid var(--border); border-radius: 12px; padding: 2px 10px; font-size: 11px; font-family: Consolas, monospace; }
+  .empty { color: var(--dim); text-align: center; padding: 16px; }
+  #toast { position: fixed; bottom: 20px; right: 20px; background: #21262d; border: 1px solid var(--accent);
+           padding: 10px 18px; border-radius: 6px; opacity: 0; transition: opacity .3s; pointer-events: none; }
+  #toast.show { opacity: 1; }
+  .spin { display:inline-block; animation: rot 1s linear infinite; }
+  @keyframes rot { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>LLM Gateway 控制台</h1>
+  <div class="sub">合并任意 OpenAI 兼容上游 → 本地统一网关 · model 填 "auto" 自动故障切换</div>
+
+  <!-- 网关信息 -->
+  <div class="card">
+    <div class="kv"><label>网关地址</label><input id="gwUrl" readonly><button class="copy" onclick="copyVal('gwUrl')">复制</button></div>
+    <div class="kv"><label>网关 Key</label><input id="gwKey" readonly class="mono"><button class="copy" onclick="copyVal('gwKey')">复制</button></div>
+    <div class="sub" style="margin:8px 0 0;font-size:12px">
+      OpenAI 协议: <code>POST /v1/chat/completions</code> &nbsp;·&nbsp;
+      Claude 协议: <code>POST /v1/messages</code> (x-api-key 或 Bearer 均可) &nbsp;·&nbsp;
+      模型列表: <code>GET /v1/models</code>
+    </div>
+  </div>
+
+  <!-- 添加上游 -->
+  <div class="card">
+    <b>添加上游 API</b>
+    <div class="row" style="margin-top:10px">
+      <input id="pName" placeholder="名称（可选，默认取域名）" style="flex:1;min-width:150px">
+      <input id="pUrl" placeholder="请求地址，如 https://ai.121628.xyz/v1" style="flex:2;min-width:260px">
+      <input id="pKey" placeholder="API 密钥 sk-..." class="mono" style="flex:1.5;min-width:220px">
+      <button class="primary" onclick="addProvider()">添加并拉取模型</button>
+    </div>
+    <div class="sub" style="margin-top:6px;font-size:12px">地址带不带 /v1 都可以，会自动处理。支持任何 OpenAI 协议兼容的中转/官方接口。</div>
+  </div>
+
+  <!-- 上游列表 -->
+  <div class="card">
+    <b>已添加的上游</b>
+    <div id="providers"></div>
+  </div>
+
+  <!-- 合并模型列表 -->
+  <div class="card">
+    <div class="row" style="justify-content:space-between">
+      <b>合并后的模型列表（auto 模式按此顺序逐个尝试）</b>
+      <span id="modelCount" class="sub" style="font-size:12px"></span>
+    </div>
+    <table>
+      <thead><tr><th>#</th><th>模型 ID</th><th>来源</th></tr></thead>
+      <tbody id="modelTable"></tbody>
+    </table>
+  </div>
+
+  <!-- 快速测试 -->
+  <div class="card">
+    <b>快速测试</b>
+    <div class="row" style="margin-top:10px">
+      <select id="testModel" style="min-width:220px"></select>
+      <input id="testPrompt" value="你好，用一句话介绍你自己" style="flex:1">
+      <select id="testProto" style="width:130px">
+        <option value="openai">OpenAI 协议</option>
+        <option value="claude">Claude 协议</option>
+      </select>
+      <button class="primary" onclick="runTest()" id="testBtn">发送</button>
+    </div>
+    <textarea id="testOut" rows="5" readonly placeholder="结果..." style="width:100%;margin-top:10px;resize:vertical"></textarea>
+  </div>
+</div>
+<div id="toast"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+let config = {}, providers = [];
+
+function toast(msg) {
+  const t = $('toast'); t.textContent = msg; t.classList.add('show');
+  setTimeout(() => t.classList.remove('show'), 2000);
+}
+function copyVal(id) {
+  navigator.clipboard.writeText($(id).value).then(() => toast('已复制'));
+}
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error || JSON.stringify(j));
+  return j;
+}
+
+async function loadAll() {
+  config = await api('/api/config');
+  $('gwUrl').value = config.baseUrl;
+  $('gwKey').value = config.gatewayKey;
+  providers = await api('/api/providers/list').catch(() => []);
+  // fallback: derive from models endpoint? keep simple: server returns list
+  render();
+}
+
+// ---- providers ----
+async function addProvider() {
+  const baseUrl = $('pUrl').value.trim(), apiKey = $('pKey').value.trim(), name = $('pName').value.trim();
+  if (!baseUrl) return toast('请填请求地址');
+  try {
+    await api('/api/providers', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, baseUrl, apiKey }),
+    });
+    $('pName').value = ''; $('pUrl').value = ''; $('pKey').value = '';
+    toast('已添加');
+    loadAll();
+  } catch (e) { toast('失败: ' + e.message); }
+}
+
+async function delProvider(id) {
+  if (!confirm('删除该上游？')) return;
+  await api('/api/providers/' + id, { method: 'DELETE' });
+  loadAll();
+}
+
+async function refreshProvider(id) {
+  await api(`/api/providers/${id}/refresh`, { method: 'POST' });
+  loadAll();
+}
+
+function render() {
+  // provider cards
+  const box = $('providers');
+  if (!providers.length) {
+    box.innerHTML = '<div class="empty">还没有上游，先在上面添加一个</div>';
+  } else {
+    box.innerHTML = providers.map(p => `
+      <div class="prov-card">
+        <div class="prov-head">
+          <div>
+            <span class="prov-name">${esc(p.name)}</span>
+            ${p.lastError ? `<span class="badge err">拉取失败: ${esc(p.lastError)}</span>`
+                          : `<span class="badge ok">${(p.models||[]).length} 个模型</span>`}
+          </div>
+          <div>
+            <button onclick="refreshProvider('${p.id}')">刷新模型</button>
+            <button class="danger" onclick="delProvider('${p.id}')">删除</button>
+          </div>
+        </div>
+        <div class="prov-url mono">${esc(p.baseUrl)} · key: ${mask(p.apiKey)}</div>
+        <div class="models-list">
+          ${(p.models||[]).map(m => `<span class="chip">${esc(m.id)}</span>`).join('')}
+        </div>
+      </div>
+    `).join('');
+  }
+
+  // merged model table
+  let n = 0;
+  const rows = [];
+  for (const p of providers) for (const m of (p.models || [])) {
+    rows.push(`<tr><td>${++n}</td><td class="mono">${esc(m.id)}</td><td>${esc(m.owned_by || p.name)}</td></tr>`);
+  }
+  $('modelTable').innerHTML = rows.join('') || '<tr><td colspan="3" class="empty">无</td></tr>';
+  $('modelCount').textContent = n + ' 个';
+
+  // test model select
+  const sel = $('testModel');
+  const cur = sel.value;
+  sel.innerHTML = '<option value="auto">auto（自动切换）</option>' +
+    [...new Set(providers.flatMap(p => (p.models||[]).map(m => m.id)))]
+      .map(id => `<option value="${esc(id)}">${esc(id)}</option>`).join('');
+  sel.value = cur && sel.querySelector(`option[value="${CSS.escape(cur)}"]`) ? cur : 'auto';
+}
+
+function esc(s) { return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function mask(k) { return !k ? '(无)' : k.length > 12 ? k.slice(0, 8) + '...' + k.slice(-4) : k; }
+
+// ---- quick test ----
+async function runTest() {
+  const btn = $('testBtn'), out = $('testOut');
+  btn.disabled = true; btn.innerHTML = '<span class="spin">◐</span> 请求中';
+  out.value = '';
+  const t0 = Date.now();
+  try {
+    const model = $('testModel').value, proto = $('testProto').value;
+    let url, body, headers = { 'Content-Type': 'application/json' };
+    if (proto === 'openai') {
+      url = '/v1/chat/completions';
+      body = { model, messages: [{ role: 'user', content: $('testPrompt').value }] };
+      headers['Authorization'] = 'Bearer ' + config.gatewayKey;
+    } else {
+      url = '/v1/messages';
+      body = { model, max_tokens: 1024, messages: [{ role: 'user', content: $('testPrompt').value }] };
+      headers['x-api-key'] = config.gatewayKey;
+    }
+    const r = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body) });
+    const j = await r.json();
+    if (!r.ok) throw new Error(JSON.stringify(j.error || j));
+    if (proto === 'openai') {
+      const msg = j.choices?.[0]?.message?.content ?? '';
+      out.value = `[${j.model}] (${Date.now() - t0}ms)\n` + msg + '\n\nusage: ' + JSON.stringify(j.usage || {});
+    } else {
+      const text = (j.content || []).map(b => b.text || '').join('');
+      out.value = `[${j.model}] (${Date.now() - t0}ms)\n` + text + '\n\nstop_reason: ' + j.stop_reason;
+    }
+  } catch (e) { out.value = '失败: ' + e.message; }
+  finally { btn.disabled = false; btn.textContent = '发送'; }
+}
+
+loadAll().catch(e => toast('加载失败: ' + e.message));
+setInterval(loadAll, 10000); // 轻量轮询保持界面同步
+</script>
+</body>
+</html>
