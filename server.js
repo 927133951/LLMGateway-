@@ -6,6 +6,16 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 
+// Last-resort guards: one bad socket must never kill the whole gateway.
+// Writing to an aborted client connection raises otherwise-unhandled
+// errors that terminate the process (every active conversation dies at once).
+process.on('uncaughtException', e => {
+  try { debugLog('[crash-guard] uncaughtException: ' + (e.stack || e)); } catch (_) {}
+});
+process.on('unhandledRejection', e => {
+  try { debugLog('[rejection-guard] ' + ((e && e.stack) || String(e))); } catch (_) {}
+});
+
 const PORT = process.env.PORT || 4567;
 const HOST = process.env.HOST || '0.0.0.0';
 const CONFIG_FILE = path.join(__dirname, 'providers.json');
@@ -353,7 +363,11 @@ async function pipeOpenAISToAnthropic(source, res, reqModel, label = '?', onInte
     'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache',
     'Connection': 'keep-alive', ...cors(),
   });
-  const send = (event, data) => res.write(enc.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
+  const send = (event, data) => {
+    if (res.destroyed) return false;
+    try { res.write(enc.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)); return true; }
+    catch { return false; }
+  };
   // if the client hangs up mid-stream, stop reading the upstream
   const onClose = () => source.reader.cancel().catch(() => {});
   res.on('close', onClose);
@@ -418,6 +432,10 @@ async function pipeOpenAISToAnthropic(source, res, reqModel, label = '?', onInte
         const dataStr = trimmed.slice(5).trim();
         if (dataStr === '[DONE]') continue;
         let chunk; try { chunk = JSON.parse(dataStr); } catch { continue; }
+        if (chunk.error && !chunk.choices) {
+          interrupted = 'upstream error mid-stream: ' + String(chunk.error.message || JSON.stringify(chunk.error)).slice(0, 120);
+          break;
+        }
         const delta = chunk.choices?.[0]?.delta || {};
         if (delta.reasoning_content) {
           ensureThinkBlock();
@@ -449,6 +467,7 @@ async function pipeOpenAISToAnthropic(source, res, reqModel, label = '?', onInte
         if (chunk.choices?.[0]?.finish_reason === 'length') stopReason = 'max_tokens';
         else if (chunk.choices?.[0]?.finish_reason === 'tool_calls') stopReason = 'tool_use';
       }
+      if (interrupted) break;
     }
   } catch (_) { interrupted = interrupted || 'pipe write failed'; }
   clearTimeout(idleTimer);
@@ -589,6 +608,11 @@ async function handleChat(req, res, protocol) {
           const ds = trimmed.slice(5).trim();
           try {
             const obj = JSON.parse(ds);
+            if (obj.error && !obj.choices) {
+              interrupted = 'upstream error mid-stream: ' + String(obj.error.message || JSON.stringify(obj.error)).slice(0, 120);
+              reader.cancel().catch(() => {});
+              return;
+            }
             const fr = obj.choices?.[0]?.finish_reason;
             if (fr) finishSeen = fr;
             res.write(`data: ${JSON.stringify(sanitizeIds(obj))}\n\n`);
@@ -706,6 +730,9 @@ function serveIndex(res) {
 }
 
 const server = http.createServer(async (req, res) => {
+  // swallow socket-level errors (client disconnects mid-write etc.)
+  res.on('error', () => {});
+  req.on('error', () => {});
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
   if (req.method === 'OPTIONS') { res.writeHead(204, cors()); return res.end(); }
 
