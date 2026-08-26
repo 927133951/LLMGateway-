@@ -10,7 +10,7 @@ const PORT = process.env.PORT || 4567;
 const HOST = process.env.HOST || '0.0.0.0';
 const CONFIG_FILE = path.join(__dirname, 'providers.json');
 const CONNECT_TIMEOUT_MS = +(process.env.CONNECT_TIMEOUT_MS || 60000); // per attempt, until headers
-const IDLE_TIMEOUT_MS = +(process.env.IDLE_TIMEOUT_MS || 120000);      // max silence mid-stream
+const IDLE_TIMEOUT_MS = +(process.env.IDLE_TIMEOUT_MS || 240000);      // max silence mid-stream
 
 // ---------- config ----------
 let config = { gatewayKey: 'sk-gw-' + crypto.randomBytes(16).toString('hex'), providers: [] };
@@ -309,13 +309,16 @@ async function probeUpstreamStream(response) {
 }
 
 // Translate an upstream OpenAI SSE stream into an Anthropic SSE stream
-async function pipeOpenAISToAnthropic(source, res, reqModel) {
+async function pipeOpenAISToAnthropic(source, res, reqModel, label = '?') {
   const enc = new TextEncoder();
   res.writeHead(200, {
     'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache',
     'Connection': 'keep-alive', ...cors(),
   });
   const send = (event, data) => res.write(enc.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
+  // if the client hangs up mid-stream, stop reading the upstream
+  const onClose = () => source.reader.cancel().catch(() => {});
+  res.on('close', onClose);
 
   send('message_start', {
     type: 'message_start',
@@ -347,14 +350,28 @@ async function pipeOpenAISToAnthropic(source, res, reqModel) {
 
   const reader = source.reader;
   let buf = source.backlog || '';
-  let idleTimer = setTimeout(() => reader.cancel().catch(() => {}), IDLE_TIMEOUT_MS);
-  const resetIdle = () => { clearTimeout(idleTimer); idleTimer = setTimeout(() => reader.cancel().catch(() => {}), IDLE_TIMEOUT_MS); };
+  let interrupted = null;
+  let clientGone = false;
+  let sawNaturalEnd = false;
+  res.on('close', () => { clientGone = true; });
+  let idleTimer = null;
+  let idleFired = false;
+  const armIdle = () => {
+    idleTimer = setTimeout(() => { idleFired = true; reader.cancel().catch(() => {}); }, IDLE_TIMEOUT_MS);
+  };
+  armIdle();
   try {
     while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
+      let r;
+      try {
+        r = await reader.read();
+      } catch (e) {
+        interrupted = `upstream read failed: ${e.message}`;
+        break;
+      }
+      if (r.done) { sawNaturalEnd = true; break; }
       resetIdle();
-      buf += decoder.decode(value, { stream: true });
+      buf += decoder.decode(r.value, { stream: true });
       const lines = buf.split('\n');
       buf = lines.pop();
       for (const line of lines) {
@@ -395,11 +412,18 @@ async function pipeOpenAISToAnthropic(source, res, reqModel) {
         else if (chunk.choices?.[0]?.finish_reason === 'tool_calls') stopReason = 'tool_use';
       }
     }
-  } catch (_) { /* client disconnect or upstream drop — just end */ }
+  } catch (_) { interrupted = interrupted || 'pipe write failed'; }
   clearTimeout(idleTimer);
+  if (!interrupted && !sawNaturalEnd && !clientGone) interrupted = 'upstream ended without finish signal';
+  if (idleFired && !sawNaturalEnd) interrupted = `no data for ${IDLE_TIMEOUT_MS}ms (idle timeout)`;
+  res.off('close', onClose);
   closeBlock(thinkIdx);
   closeBlock(textIdx);
   for (const tb of openToolBlocks.values()) send('content_block_stop', { type: 'content_block_stop', index: tb.out });
+  if (interrupted && !clientGone) {
+    debugLog(`[cut] ${label}: ${interrupted} — sent error event to client`);
+    send('error', { type: 'error', error: { type: 'api_error', message: `stream interrupted: ${interrupted}` } });
+  }
   send('message_delta', { type: 'message_delta', delta: { stop_reason: stopReason, stop_sequence: null }, usage: { output_tokens: outTokens } });
   send('message_stop', { type: 'message_stop' });
   res.end();
@@ -460,7 +484,7 @@ async function handleChat(req, res, protocol) {
     }
 
     if (protocol === 'claude') {
-      try { await pipeOpenAISToAnthropic(probe, res, body.model); } catch (_) {}
+      try { await pipeOpenAISToAnthropic(probe, res, body.model, `${cand.provider.name}/${cand.model}`); } catch (_) {}
       return;
     }
     // OpenAI passthrough — replay probed bytes then pipe the rest,
@@ -469,11 +493,18 @@ async function handleChat(req, res, protocol) {
       'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache',
       'Connection': 'keep-alive', ...cors(),
     });
+    const label = `${cand.provider.name}/${cand.model}`;
     const reader = probe.reader;
     const dec = new TextDecoder();
     let carry = '';
-    let idleTimer = setTimeout(() => reader.cancel().catch(() => {}), IDLE_TIMEOUT_MS);
-    const kick = () => { clearTimeout(idleTimer); idleTimer = setTimeout(() => reader.cancel().catch(() => {}), IDLE_TIMEOUT_MS); };
+    let sawDone = false, interrupted = null, clientGone = false, idleFired = false;
+    res.on('close', () => { clientGone = true; });
+    const onClientClose = () => reader.cancel().catch(() => {});
+    res.on('close', onClientClose);
+    let idleTimer = null;
+    const armIdle = () => { idleTimer = setTimeout(() => { idleFired = true; reader.cancel().catch(() => {}); }, IDLE_TIMEOUT_MS); };
+    armIdle();
+    const kick = () => { clearTimeout(idleTimer); armIdle(); };
     const writeSanitized = text => {
       // process line-wise, preserving the exact event boundaries
       const lines = text.split('\n');
@@ -484,6 +515,8 @@ async function handleChat(req, res, protocol) {
           const ds = trimmed.slice(5).trim();
           try { res.write(`data: ${JSON.stringify(sanitizeIds(JSON.parse(ds)))}\n\n`); continue; }
           catch { /* not JSON — forward untouched */ }
+        } else if (trimmed === 'data: [DONE]' || trimmed === 'data:[DONE]') {
+          sawDone = true;
         }
         res.write(line + '\n');
       }
@@ -491,14 +524,22 @@ async function handleChat(req, res, protocol) {
     try {
       for (const c of probe.chunks) writeSanitized(dec.decode(c, { stream: true }));
       while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
+        let r;
+        try { r = await reader.read(); } catch (e) { interrupted = `upstream read failed: ${e.message}`; break; }
+        if (r.done) break;
         kick();
-        writeSanitized(dec.decode(value, { stream: true }));
+        writeSanitized(dec.decode(r.value, { stream: true }));
       }
-      if (carry) res.write(carry + '\n');
-    } catch (_) {}
+      if (!interrupted && carry) res.write(carry + '\n');
+    } catch (_) { interrupted = interrupted || 'pipe write failed'; }
     clearTimeout(idleTimer);
+    res.off('close', onClientClose);
+    if (!interrupted && !sawDone && !clientGone) interrupted = 'upstream ended without [DONE]';
+    if (idleFired && !sawDone) interrupted = `no data for ${IDLE_TIMEOUT_MS}ms (idle timeout)`;
+    if (interrupted && !clientGone) {
+      debugLog(`[cut] ${label}: ${interrupted} — sent error event to client`);
+      res.write(`data: ${JSON.stringify({ error: { message: `stream interrupted: ${interrupted}`, type: 'server_error' } })}\n\n`);
+    }
     res.end();
     return;
   }
