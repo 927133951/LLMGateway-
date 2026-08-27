@@ -95,6 +95,24 @@
     <div class="sub" style="margin-top:6px;font-size:12px">地址带不带 /v1 都可以，会自动处理。支持任何 OpenAI 协议兼容的中转/官方接口。</div>
   </div>
 
+  <!-- 模型调度控制 -->
+  <div class="card">
+    <div class="row" style="justify-content:space-between">
+      <b>模型调度控制</b>
+      <label style="font-size:13px;cursor:pointer">
+        <input type="checkbox" id="freeOnly" onchange="saveSched()" style="margin-right:6px">仅调度带 free 标记的模型
+      </label>
+    </div>
+    <input id="catalogSearch" placeholder="搜索模型 ID…" oninput="renderCatalog()" style="width:100%;margin:8px 0">
+    <div id="catalog" style="max-height:260px;overflow-y:auto;border-top:1px solid var(--border)">
+      <table>
+        <thead><tr><th>模型</th><th>来源</th><th style="width:110px">状态</th></tr></thead>
+        <tbody id="catalogBody"></tbody>
+      </table>
+    </div>
+    <div class="sub" style="font-size:11px;margin-top:6px">被排除的模型不参与 auto 调度（点名指定仍可用）。</div>
+  </div>
+
   <!-- 上游列表 -->
   <div class="card">
     <b>已添加的上游</b>
@@ -154,6 +172,8 @@ async function loadAll() {
   $('gwKey').value = config.gatewayKey;
   if (document.activeElement !== $('sysPrompt')) $('sysPrompt').value = config.systemPrompt || '';
   $('minParams').value = config.minModelParamsB || 0;
+  $('freeOnly').checked = !!config.freeOnly;
+  loadCatalog();
   providers = await api('/api/providers/list').catch(() => []);
   // fallback: derive from models endpoint? keep simple: server returns list
   render();
@@ -167,6 +187,35 @@ async function saveConfig() {
     });
     toast('设置已保存，立即生效');
   } catch (e) { toast('保存失败: ' + e.message); }
+}
+
+let catalog = [];
+async function loadCatalog() {
+  try { catalog = await api('/api/catalog'); renderCatalog(); } catch (_) {}
+}
+function renderCatalog() {
+  const q = ($('catalogSearch').value || '').toLowerCase();
+  const body = $('catalogBody');
+  const rows = catalog.filter(m => !q || m.id.toLowerCase().includes(q) || (m.owned_by||'').toLowerCase().includes(q))
+    .map(m => `<tr style="${m.excluded ? 'opacity:.45;text-decoration:line-through' : ''}">
+      <td class="mono">${esc(m.id)}</td><td>${esc(m.owned_by || '')}</td>
+      <td><button onclick="toggleExclude('${esc(m.id)}', ${!m.excluded})" class="${m.excluded ? '' : 'danger'}">${m.excluded ? '已排除 · 恢复' : '排除'}</button></td></tr>`)
+    .join('');
+  body.innerHTML = rows || '<tr><td colspan="3" class="empty">无</td></tr>';
+}
+async function toggleExclude(id, excluded) {
+  try {
+    await api('/api/catalog/toggle', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id, excluded }) });
+    const item = catalog.find(m => m.id === id);
+    if (item) item.excluded = excluded;
+    renderCatalog();
+    toast(excluded ? `已排除 ${id}` : `已恢复 ${id}`);
+  } catch (e) { toast('操作失败: ' + e.message); }
+}
+function saveSched() {
+  api('/api/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ freeOnly: $('freeOnly').checked }) })
+    .then(() => toast($('freeOnly').checked ? '已开启：仅调度 free 模型' : '已关闭：调度全部模型'))
+    .catch(e => toast('保存失败: ' + e.message));
 }
 
 // ---- providers ----

@@ -29,6 +29,8 @@ try {
     const loaded = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
     config = { ...config, ...loaded };
     if (!config.gatewayKey) config.gatewayKey = 'sk-gw-' + crypto.randomBytes(16).toString('hex');
+    if (!Array.isArray(config.modelBlacklist)) config.modelBlacklist = [];
+    if (typeof config.freeOnly !== 'boolean') config.freeOnly = false;
   }
 } catch (e) { console.error('[config] load failed:', e.message); }
 function save() { fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2)); }
@@ -174,6 +176,11 @@ function passesSizeFilter(modelId) {
   const p = parseParamCount(modelId);
   return p == null ? true : p >= minB;
 }
+// "-free" / ":free" / "_free" markers — the only reliable billing signal most
+// aggregators expose; /v1/models carries no pricing metadata at all
+function isFreeModelId(id) {
+  return /(^|[^a-z0-9])free([^a-z0-9]|$)/i.test(String(id || ''));
+}
 
 // Build ordered candidate chain [{provider, model}]
 let autoCursor = 0;
@@ -189,6 +196,17 @@ function candidatesFor(model) {
     // explicit user intent and is always honored
     const filtered = chain.filter(c => passesSizeFilter(c.model));
     if (filtered.length) chain = filtered;
+    // free-only mode: keep only models marked free in their id
+    if (config.freeOnly) {
+      const free = chain.filter(c => isFreeModelId(c.model));
+      if (free.length) chain = free;
+    }
+    // manual blacklist (user-excluded models, e.g. known paid ones)
+    const bl = Array.isArray(config.modelBlacklist) ? config.modelBlacklist : [];
+    if (bl.length) {
+      const kept = chain.filter(c => !bl.includes(c.model));
+      if (kept.length) chain = kept;
+    }
   } else {
     chain = provs.flatMap(p => p.models.filter(m => m.id === model).map(() => ({ provider: p, model })));
     if (!chain.length) chain = provs.map(p => ({ provider: p, model })); // raw name everywhere
@@ -716,6 +734,7 @@ async function handleApi(req, res, url) {
       baseUrl: `http://localhost:${PORT}/v1`,
       systemPrompt: config.systemPrompt || '',
       minModelParamsB: +(config.minModelParamsB || 0),
+      freeOnly: !!config.freeOnly,
       timeout: { connectMs: CONNECT_TIMEOUT_MS, idleMs: IDLE_TIMEOUT_MS },
     });
   }
@@ -726,8 +745,31 @@ async function handleApi(req, res, url) {
       const v = parseFloat(b.minModelParamsB);
       config.minModelParamsB = isNaN(v) || v < 0 ? 0 : v;
     }
+    if ('freeOnly' in b) config.freeOnly = !!b.freeOnly;
     save();
-    return json(res, 200, { ok: true, systemPrompt: config.systemPrompt || '', minModelParamsB: +(config.minModelParamsB || 0) });
+    return json(res, 200, { ok: true });
+  }
+  // full model catalog with exclusion state for the console
+  if (route === 'GET /api/catalog') {
+    const bl = Array.isArray(config.modelBlacklist) ? config.modelBlacklist : [];
+    const seen = new Map();
+    for (const p of config.providers) {
+      for (const m of p.models || []) {
+        if (!seen.has(m.id)) seen.set(m.id, { id: m.id, owned_by: m.owned_by || p.name, excluded: bl.includes(m.id) });
+      }
+    }
+    return json(res, 200, [...seen.values()]);
+  }
+  if (route === 'POST /api/catalog/toggle') {
+    const b = await readJSON(req);
+    if (!b.id) return json(res, 400, { error: 'id required' });
+    if (!Array.isArray(config.modelBlacklist)) config.modelBlacklist = [];
+    const i = config.modelBlacklist.indexOf(b.id);
+    const wantExcluded = b.excluded !== undefined ? !!b.excluded : i < 0;
+    if (wantExcluded && i < 0) config.modelBlacklist.push(b.id);
+    if (!wantExcluded && i >= 0) config.modelBlacklist.splice(i, 1);
+    save();
+    return json(res, 200, { ok: true, id: b.id, excluded: wantExcluded });
   }
   if (route === 'GET /api/providers/list') {
     return json(res, 200, config.providers);
